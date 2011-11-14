@@ -1,18 +1,34 @@
 (ns touchosc-experiment.sequencer
   (:use [touchosc-experiment.touchosc :only (simple-handler register-handlers)])
+  (:use clojure.algo.monads)
   (:use overtone.core))
 
-(defonce sequencer-state (atom (vec (repeat 8 (vec (repeat 8 0.0))))))
+(defonce sequencer-state (atom (vec (repeat 8 (vec (repeat 8 0))))))
 
-(definst kick []
-  (let [src (+ (sin-osc 80) (sin-osc 160))
-        env (env-gen (perc 0.001 0.3) :action FREE)]
-    (* 3.5 src env)))
+(definst kick [volume 1.0]
+  (let [body-freq (* 220 (env-gen (lin-env 0.01 0 0.3 1) :action NO-ACTION))
+        body (sin-osc body-freq)
+        
+        pop-freq (+ 20 (* 400 (env-gen (lin-env 0.01 0 0.1 1) :action NO-ACTION)))
+        pop  (sin-osc pop-freq)
+        
+        env  (env-gen (perc 0.001 1.5) :action FREE)
+        ]
+    (* env (+ body pop))))
 
 (definst hat []
   (let [src (white-noise)
         env (env-gen (perc 0.001 0.3) :action FREE)]
     (* 0.7 src env)))
+
+(definst bass [freq 50 volume 1.0 wah 300]
+  (let [son (saw freq)
+        son (+ son (bpf son (* wah 0.1)))]
+    (* volume son)))
+
+(comment
+  (bass)
+  )
 
 (defonce beep-freq (atom 1100))
 
@@ -40,38 +56,72 @@
         son (+ son (* 0.3 (g-verb son 10 0.1 0.7)))]
     (* vol son)))
 
-(dubstep)
-
 (def metro (metronome 128))
 
 (def inst-map
-  {0 kick
-   1 hat
-   2 #(beep @beep-freq)
-   3 dubstep})
+  {0 {1 kick}
+   1 {1 hat}
+   2 {1 #(beep @beep-freq)}
+   3 dubstep
+   4 {1 #(ctl bass :volume 1) 0 #(ctl bass :volume 0)}})
+
+(defn play-inst [index]
+  (let [inst (inst-map index)]
+    (inst)))
+
+(defn beat [dur & insts]
+  (fn [time]
+    (fn [c]
+      (doseq [inst insts]
+        (at time (inst)))
+      (apply-at (+ time dur) c (+ time dur) []))))
+
+(defn chain-beats [beats]
+  (with-monad cont-m
+    (m-chain beats)))
+
+(defn loop-beat [beat]
+  ((fn restart [time]
+     ((beat time) restart))
+   (now)))
+
+(defn inst-num [n]
+  (fn []
+    (play-inst n)))
+
+(defn should-play? [notes inst beat]
+  (not (zero? (get-in @notes [inst beat]))))
 
 (defn sequencer [beat notes]
   (at (metro beat)
       (let [mod-beat (mod beat 8)]
         (doseq [[index inst] inst-map]
-          (let [val (get-in @notes [index mod-beat])]
-            (if (= 3 index)
-              (ctl dubstep :vol val)
-              (when (not (zero? val))
-                (inst)))))))
+          (let [val  (get-in @notes [index mod-beat])
+                inst (get inst val (fn [] nil))]
+            (inst)))))
   (apply-at (metro (inc beat)) #'sequencer (inc beat) [notes]))
+
+(defn beat-for [notes mod-beat]
+  (apply beat 150 (for [inst (range 4)
+                        :when (should-play? notes inst mod-beat)]
+                    (inst-num inst))))
+
+#_(defn sequencer [beat notes]
+  (loop-beat
+   (chain-beats (map #(beat-for notes %) (range 8)))))
 
 (defn sequencer-off []
   (stop)
   )
 
 (defn sequencer-on []
+  (bass :volume 0)
   (sequencer (metro) sequencer-state))
 
 (defn make-sequencer-handler [inst beat]
   (simple-handler [arg]
                   (swap! sequencer-state
-                         assoc-in [inst beat] arg)))
+                         assoc-in [inst beat] (int arg))))
 
 (def ^{:private true} multitoggle-map-entries
   (let [path-from (fn [x y] (str "/4/multitoggle/" (inc y) "/" (inc x)))]
@@ -90,7 +140,12 @@
     "/1/toggle4" (simple-handler [arg] (ctl dubstep :decimate? arg))
     "/1/fader5"  (simple-handler [arg]
                                  (let [new-bpm (scale-range arg 0 1 160 500)]
-                                   (metro :bpm new-bpm)))}
+                                   (metro :bpm new-bpm)))
+    "/3/xy"      (simple-handler [arg1 arg2]
+                                 (do
+                                   (ctl bass :freq (scale-range arg1 0 1 20 250))
+                                   (ctl bass :wah  (scale-range arg2 0 1 300 3000))))}
    multitoggle-map-entries))
 
+(touchosc-experiment.touchosc/start-osc)
 (register-handlers sequencer-map)
